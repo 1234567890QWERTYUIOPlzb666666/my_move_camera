@@ -1,0 +1,4 @@
+interface:
+  display_name: "Embedded UI Architecture"
+  short_description: "Plan modular C/Linux Qt and LVGL products"
+  default_prompt: "Use $design-embedded-ui-architecture to design a modular C/Linux application with Qt or LVGL."
