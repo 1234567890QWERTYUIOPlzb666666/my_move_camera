@@ -9,7 +9,16 @@
 #define UI_HEIGHT 480
 
 typedef bool (*camera_page_capture_cb_t)(void * user_data);
-typedef bool (*camera_page_record_cb_t)(bool start, void * user_data);
+
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    uint32_t fps;
+} camera_page_record_settings_t;
+
+typedef bool (*camera_page_record_cb_t)(bool start,
+                                        const camera_page_record_settings_t * settings,
+                                        void * user_data);
 typedef bool (*camera_page_play_video_cb_t)(const char * path, void * user_data);
 
 void camera_page_create(uint32_t screen_w, uint32_t screen_h);

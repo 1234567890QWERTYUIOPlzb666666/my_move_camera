@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include "page/inc/camera_page.h"
+#include "page/inc/quick_settings_page.h"
 #include "camera_capture.h"
 #include "camera_media.h"
 #include "camera_recorder.h"
@@ -125,12 +126,15 @@ static const char *video_dir_get(void)
     return video_dir;
 }
 
-static bool handle_recording(bool start, void * user_data)
+static bool handle_recording(bool start,
+                             const camera_page_record_settings_t * settings,
+                             void * user_data)
 {
     (void)user_data;
 
 #if USE_SDL
     (void)start;
+    (void)settings;
     return false;
 #else
     if (start) {
@@ -140,6 +144,9 @@ static bool handle_recording(bool start, void * user_data)
         const char * preview_device_path = camera_capture_get_device_path();
         const char * requested_record_device = getenv("MY_MOVE_CAMERA_RECORD_VIDEO");
         char record_device_path[64];
+        uint32_t record_width = settings != NULL ? settings->width : 1280;
+        uint32_t record_height = settings != NULL ? settings->height : 720;
+        uint32_t record_fps = settings != NULL ? settings->fps : 30;
         time_t now = time(NULL);
         struct tm local_time;
 
@@ -175,7 +182,11 @@ static bool handle_recording(bool start, void * user_data)
         if (preview_paused_for_recording) {
             camera_capture_stop();
         }
-        if (camera_recorder_start(last_video_device, path) != 0) {
+        if (camera_recorder_start(last_video_device,
+                                  path,
+                                  record_width,
+                                  record_height,
+                                  record_fps) != 0) {
             perror("Unable to start GStreamer recording");
             if (preview_paused_for_recording) {
                 camera_capture_start(UI_WIDTH, UI_HEIGHT);
@@ -184,8 +195,11 @@ static bool handle_recording(bool start, void * user_data)
             return false;
         }
 
-        printf("Video recording to: %s via %s%s\n",
+        printf("Video recording to: %s (%ux%u@%u) via %s%s\n",
                path,
+               record_width,
+               record_height,
+               record_fps,
                last_video_device,
                preview_paused_for_recording ? " (preview paused)" : "");
         return true;
@@ -296,6 +310,9 @@ static int sdl_init(void)
 
     renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (renderer == NULL) {
+        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+    }
+    if (renderer == NULL) {
         fprintf(stderr, "Renderer could not be created! SDL_Error: %s\n", SDL_GetError());
         return -1;
     }
@@ -345,6 +362,7 @@ static void sdl_mouse_read(lv_indev_drv_t * indev_drv, lv_indev_data_t * data)
     data->point.y = mouse_y;
     data->state = mouse_pressed ? LV_INDEV_STATE_PR : LV_INDEV_STATE_REL;
     camera_page_pointer_sample(mouse_pressed, mouse_x, mouse_y);
+    quick_settings_page_pointer_sample(mouse_pressed, mouse_x, mouse_y);
 }
 
 #else
@@ -507,6 +525,7 @@ static void touchdev_read(lv_indev_drv_t * indev_drv, lv_indev_data_t * data)
     data->point.y = logical_y;
     data->state = touch_pressed ? LV_INDEV_STATE_PR : LV_INDEV_STATE_REL;
     camera_page_pointer_sample(touch_pressed, data->point.x, data->point.y);
+    quick_settings_page_pointer_sample(touch_pressed, data->point.x, data->point.y);
 }
 
 static int fbdev_init(void)
@@ -572,16 +591,6 @@ static void fbdev_flush(lv_disp_drv_t * disp_drv, const lv_area_t * area, lv_col
     lv_disp_flush_ready(disp_drv);
 }
 #endif
-
-// 精确的 LVGL 时间基准后台线程
-static void * tick_thread(void * data) {
-    (void)data;
-    while(1) {
-        usleep(5000); // 5毫秒
-        lv_tick_inc(5);
-    }
-    return NULL;
-}
 
 // ============================================================================
 // 程序入口 main 函数 (实现条件宏的分支启动)
@@ -677,24 +686,6 @@ int main(int argc, char **argv)
     }
 #endif
 
-    // 6. 启动高精度时间 Tick 线程
-    pthread_t tid;
-    if (pthread_create(&tid, NULL, tick_thread, NULL) != 0) {
-        perror("Error: pthread_create failed");
-        free(buf1);
-#if USE_SDL
-        free(tbuf);
-        SDL_DestroyTexture(texture);
-        SDL_DestroyRenderer(renderer);
-        SDL_DestroyWindow(window);
-        SDL_Quit();
-#else
-        if (touchfd >= 0) close(touchfd);
-        drm_display_deinit();
-#endif
-        return -1;
-    }
-
     // 7. 渲染运动相机 UI (根据显示器物理大小，自适应全屏对齐)
 #if USE_SDL
     camera_page_create(UI_WIDTH, UI_HEIGHT);
@@ -748,13 +739,43 @@ int main(int argc, char **argv)
     camera_page_set_record_callback(handle_recording, NULL);
     camera_page_set_play_video_callback(play_video, NULL);
 
+#if USE_SDL
+    if (getenv("MY_MOVE_CAMERA_TEST_OPEN_WIFI") != NULL) {
+        lv_obj_t * test_curtain = quick_settings_page_create_curtain(lv_scr_act());
+        lv_obj_move_foreground(test_curtain);
+        lv_obj_update_layout(lv_scr_act());
+    }
+#endif
+
     printf("UI Rendered. Entering main loop...\n");
 
     // 8. 周期事件主循环
 #if USE_SDL
     bool quit = false;
+    bool test_auto_quit = getenv("MY_MOVE_CAMERA_TEST_OPEN_WIFI") != NULL;
+    bool test_no_render = getenv("MY_MOVE_CAMERA_TEST_NO_RENDER") != NULL;
+    uint32_t test_loop_count = 0;
+    bool test_click_sent = false;
     SDL_Event event;
     while (!quit) {
+        if (test_auto_quit && !test_click_sent && test_loop_count > 4) {
+            SDL_Event down;
+            SDL_Event up;
+            memset(&down, 0, sizeof(down));
+            memset(&up, 0, sizeof(up));
+            down.type = SDL_MOUSEBUTTONDOWN;
+            down.button.button = SDL_BUTTON_LEFT;
+            down.button.x = 430;
+            down.button.y = 270;
+            up.type = SDL_MOUSEBUTTONUP;
+            up.button.button = SDL_BUTTON_LEFT;
+            up.button.x = 430;
+            up.button.y = 270;
+            SDL_PushEvent(&down);
+            SDL_PushEvent(&up);
+            test_click_sent = true;
+        }
+
         // A. 轮询同步鼠标与窗口事件
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_QUIT) {
@@ -765,27 +786,38 @@ int main(int argc, char **argv)
                     mouse_x = event.button.x;
                     mouse_y = event.button.y;
                     camera_page_pointer_sample(mouse_pressed, mouse_x, mouse_y);
+                    quick_settings_page_pointer_sample(mouse_pressed, mouse_x, mouse_y);
                 }
             } else if (event.type == SDL_MOUSEBUTTONUP) {
                 if (event.button.button == SDL_BUTTON_LEFT) {
                     mouse_pressed = false;
                     camera_page_pointer_sample(mouse_pressed, mouse_x, mouse_y);
+                    quick_settings_page_pointer_sample(mouse_pressed, mouse_x, mouse_y);
                 }
             } else if (event.type == SDL_MOUSEMOTION) {
                 mouse_x = event.motion.x;
                 mouse_y = event.motion.y;
                 camera_page_pointer_sample(mouse_pressed, mouse_x, mouse_y);
+                quick_settings_page_pointer_sample(mouse_pressed, mouse_x, mouse_y);
             }
         }
 
         // B. 调度 LVGL 计时器
+        lv_tick_inc(5);
         lv_timer_handler();
+        quick_settings_page_poll();
 
         // C. 将虚拟显存写入纹理并由 SDL 硬件渲染
-        SDL_UpdateTexture(texture, NULL, tbuf, UI_WIDTH * sizeof(uint32_t));
-        SDL_RenderClear(renderer);
-        SDL_RenderCopy(renderer, texture, NULL, NULL);
-        SDL_RenderPresent(renderer);
+        if (!test_no_render) {
+            SDL_UpdateTexture(texture, NULL, tbuf, UI_WIDTH * sizeof(uint32_t));
+            SDL_RenderClear(renderer);
+            SDL_RenderCopy(renderer, texture, NULL, NULL);
+            SDL_RenderPresent(renderer);
+        }
+
+        if (test_auto_quit && ++test_loop_count > 400) {
+            quit = true;
+        }
 
         usleep(5000); // 5毫秒
     }
@@ -801,7 +833,9 @@ int main(int argc, char **argv)
     SDL_Quit();
 #else
     while (1) {
+        lv_tick_inc(5);
         lv_timer_handler();
+        quick_settings_page_poll();
         usleep(5000);
     }
 

@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -39,8 +40,19 @@ static void replace_tokens(char * out,
                            size_t out_size,
                            const char * template,
                            const char * device,
-                           const char * path)
+                           const char * path,
+                           uint32_t width,
+                           uint32_t height,
+                           uint32_t fps)
 {
+    char width_text[16];
+    char height_text[16];
+    char fps_text[16];
+
+    snprintf(width_text, sizeof(width_text), "%u", width);
+    snprintf(height_text, sizeof(height_text), "%u", height);
+    snprintf(fps_text, sizeof(fps_text), "%u", fps);
+
     out[0] = '\0';
 
     for (const char * p = template; *p != '\0' && strlen(out) + 1 < out_size;) {
@@ -50,6 +62,15 @@ static void replace_tokens(char * out,
         } else if (strncmp(p, "{path}", 6) == 0) {
             shell_quote_append(out, out_size, path);
             p += 6;
+        } else if (strncmp(p, "{width}", 7) == 0) {
+            strncat(out, width_text, out_size - strlen(out) - 1);
+            p += 7;
+        } else if (strncmp(p, "{height}", 8) == 0) {
+            strncat(out, height_text, out_size - strlen(out) - 1);
+            p += 8;
+        } else if (strncmp(p, "{fps}", 5) == 0) {
+            strncat(out, fps_text, out_size - strlen(out) - 1);
+            p += 5;
         } else {
             size_t used = strlen(out);
             out[used] = *p++;
@@ -102,7 +123,11 @@ bool camera_recorder_is_recording(void)
     return process_is_running(recorder_pid);
 }
 
-int camera_recorder_start(const char * video_device, const char * path)
+int camera_recorder_start(const char * video_device,
+                          const char * path,
+                          uint32_t width,
+                          uint32_t height,
+                          uint32_t fps)
 {
     const char * pipeline = getenv("MY_MOVE_CAMERA_RECORD_PIPELINE");
     char command[1024];
@@ -119,22 +144,25 @@ int camera_recorder_start(const char * video_device, const char * path)
         errno = EINVAL;
         return -1;
     }
+    if (width == 0) width = 1280;
+    if (height == 0) height = 720;
+    if (fps == 0) fps = 30;
 
     if (pipeline == NULL || pipeline[0] == '\0') {
         pipeline =
             "gst-launch-1.0 -e "
             "v4l2src device={device} ! "
-            "video/x-raw,format=NV12,width=1280,height=720,framerate=30/1 ! "
+            "video/x-raw,format=NV12,width={width},height={height},framerate={fps}/1 ! "
             "mpph264enc ! h264parse ! mp4mux faststart=true ! filesink location={path} "
             "|| gst-launch-1.0 -e "
             "v4l2src device={device} ! "
-            "video/x-raw,width=1280,height=720,framerate=30/1 ! "
+            "video/x-raw,width={width},height={height},framerate={fps}/1 ! "
             "videoconvert ! "
             "x264enc tune=zerolatency speed-preset=ultrafast bitrate=4096 key-int-max=30 ! "
             "h264parse ! mp4mux faststart=true ! filesink location={path}";
     }
 
-    replace_tokens(command, sizeof(command), pipeline, video_device, path);
+    replace_tokens(command, sizeof(command), pipeline, video_device, path, width, height, fps);
     recorder_pid = spawn_shell_command(command);
     if (recorder_pid < 0) return -1;
 
@@ -184,7 +212,7 @@ int camera_recorder_play(const char * path)
         command_template = "gst-play-1.0 {path}";
     }
 
-    replace_tokens(command, sizeof(command), command_template, "", path);
+    replace_tokens(command, sizeof(command), command_template, "", path, 0, 0, 0);
     pid_t pid = spawn_shell_command(command);
     if (pid < 0) return -1;
 
@@ -213,7 +241,7 @@ int camera_recorder_play_blocking(const char * path)
         command_template = "gst-play-1.0 --videosink=kmssink {path}";
     }
 
-    replace_tokens(command, sizeof(command), command_template, "", path);
+    replace_tokens(command, sizeof(command), command_template, "", path, 0, 0, 0);
     pid = spawn_shell_command(command);
     if (pid < 0) return -1;
 

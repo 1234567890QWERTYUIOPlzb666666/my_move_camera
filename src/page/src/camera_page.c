@@ -27,6 +27,8 @@
 #define SETTINGS_PANEL_W 400
 #define SETTINGS_EDGE_TOUCH_W 18
 #define QUICK_EDGE_TOUCH_H 96
+#define RECORD_SETTINGS_EDGE_TOUCH_H 32
+#define RECORD_SETTINGS_PANEL_H 206
 #define QUICK_SWIPE_MIN_DIST 52
 #define QUICK_DRAG_START_DIST 10
 #define PLAYBACK_FPS 30
@@ -74,13 +76,18 @@ static bool album_playback_stop_requested = false;
 static GstElement *album_playback_pipeline = NULL;
 #endif
 static lv_obj_t *settings_panel;
+static lv_obj_t *record_settings_panel;
+static lv_obj_t *record_resolution_btns[3];
+static lv_obj_t *record_fps_btns[2];
 static lv_timer_t *rec_timer;
 static bool settings_panel_open = false;
+static bool record_settings_panel_open = false;
 static camera_mode_t current_mode = MODE_VIDEO;
 static bool camera_page_active = false;
 static bool quick_swipe_tracking = false;
 static lv_point_t quick_swipe_start;
 static bool global_quick_swipe_tracking = false;
+static bool global_record_settings_swipe_tracking = false;
 static bool global_quick_open_pending = false;
 static int32_t global_quick_swipe_start_y = 0;
 static lv_obj_t *quick_curtain = NULL;
@@ -100,9 +107,30 @@ static camera_page_play_video_cb_t play_video_callback = NULL;
 static void *play_video_callback_user_data = NULL;
 static bool quick_curtain_dragging = false;
 static int32_t quick_curtain_start_y = 0;
+static bool record_settings_dragging = false;
+static int32_t record_settings_start_y = 0;
+static int32_t record_settings_drag_start_y = UI_HEIGHT;
+
+typedef struct {
+    const char * label;
+    uint32_t width;
+    uint32_t height;
+} record_resolution_option_t;
+
+static const record_resolution_option_t record_resolution_options[] = {
+    {"720p", 1280, 720},
+    {"1080p", 1920, 1080},
+    {"2K", 2592, 1944},
+};
+
+static const uint32_t record_fps_options[] = {30, 15};
+static uint8_t record_resolution_index = 0;
+static uint8_t record_fps_index = 0;
 
 static bool is_quick_settings_swipe(int32_t start_y, int32_t end_y);
 static void quick_curtain_set_delta(int32_t delta_y);
+static void record_settings_set_drag_y(int32_t y);
+static void record_settings_finish(void);
 static void album_photo_list_clear(void);
 static void album_playback_stop(void);
 static bool album_playback_start(const char * path);
@@ -137,6 +165,9 @@ static void clear_camera_page_refs(void)
     album_play_btn = NULL;
     album_progress_slider = NULL;
     album_progress_time_label = NULL;
+    record_settings_panel = NULL;
+    memset(record_resolution_btns, 0, sizeof(record_resolution_btns));
+    memset(record_fps_btns, 0, sizeof(record_fps_btns));
     free(album_view_pixels);
     album_view_pixels = NULL;
     album_photo_list_clear();
@@ -144,6 +175,9 @@ static void clear_camera_page_refs(void)
     preview_container = NULL;
     preview_image = NULL;
     settings_panel_open = false;
+    record_settings_panel_open = false;
+    record_settings_dragging = false;
+    global_record_settings_swipe_tracking = false;
 }
 
 static void create_preview_image(void)
@@ -1085,6 +1119,11 @@ static void settings_panel_set_x(void * var, int32_t x)
     lv_obj_set_x((lv_obj_t *)var, x);
 }
 
+static void record_settings_panel_set_y(void * var, int32_t y)
+{
+    lv_obj_set_y((lv_obj_t *)var, y);
+}
+
 static void quick_curtain_delete_ready_cb(lv_anim_t * anim)
 {
     lv_obj_t * curtain = (lv_obj_t *)anim->var;
@@ -1179,6 +1218,76 @@ static lv_obj_t *label_create(lv_obj_t * parent, const char * text, lv_color_t c
     return label;
 }
 
+static void record_settings_get_text(char * out, size_t out_size)
+{
+    snprintf(out,
+             out_size,
+             "%s%u",
+             record_resolution_options[record_resolution_index].label,
+             record_fps_options[record_fps_index]);
+}
+
+static void record_option_button_set_selected(lv_obj_t * btn, bool selected)
+{
+    if (btn == NULL) {
+        return;
+    }
+
+    lv_obj_set_style_bg_color(btn, selected ? c_yellow() : lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(btn, selected ? 255 : 132, 0);
+    lv_obj_set_style_border_color(btn, selected ? c_yellow() : lv_color_white(), 0);
+    lv_obj_set_style_border_opa(btn, selected ? 255 : 112, 0);
+
+    lv_obj_t * label = lv_obj_get_child(btn, 0);
+    if (label != NULL) {
+        lv_obj_set_style_text_color(label, selected ? lv_color_black() : lv_color_white(), 0);
+    }
+}
+
+static void record_settings_update_ui(void)
+{
+    char detail[16];
+
+    for (size_t i = 0; i < sizeof(record_resolution_btns) / sizeof(record_resolution_btns[0]); i++) {
+        record_option_button_set_selected(record_resolution_btns[i],
+                                          i == record_resolution_index);
+    }
+    for (size_t i = 0; i < sizeof(record_fps_btns) / sizeof(record_fps_btns[0]); i++) {
+        record_option_button_set_selected(record_fps_btns[i], i == record_fps_index);
+    }
+
+    if (mode_detail_label != NULL && current_mode == MODE_VIDEO) {
+        record_settings_get_text(detail, sizeof(detail));
+        lv_label_set_text(mode_detail_label, detail);
+    }
+}
+
+static void record_resolution_event_cb(lv_event_t * e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED || is_recording) {
+        return;
+    }
+
+    uintptr_t index = (uintptr_t)lv_event_get_user_data(e);
+    if (index < sizeof(record_resolution_options) / sizeof(record_resolution_options[0])) {
+        record_resolution_index = (uint8_t)index;
+        record_settings_update_ui();
+    }
+}
+
+static void record_fps_event_cb(lv_event_t * e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED || is_recording) {
+        return;
+    }
+
+    uintptr_t index = (uintptr_t)lv_event_get_user_data(e);
+    if (index < sizeof(record_fps_options) / sizeof(record_fps_options[0])) {
+        record_fps_index = (uint8_t)index;
+        record_settings_update_ui();
+    }
+}
+
 static void update_record_time(void)
 {
     uint32_t m = rec_seconds / 60;
@@ -1197,9 +1306,11 @@ static void update_mode_ui(void)
 {
     lv_obj_clear_flag(rec_time_label, LV_OBJ_FLAG_HIDDEN);
     if (current_mode == MODE_VIDEO) {
+        char detail[16];
         lv_label_set_text(mode_label, LV_SYMBOL_VIDEO);
         lv_label_set_text(rec_time_label, "00:00");
-        lv_label_set_text(mode_detail_label, "4K60");
+        record_settings_get_text(detail, sizeof(detail));
+        lv_label_set_text(mode_detail_label, detail);
         lv_obj_set_style_bg_color(shutter_icon, c_red(), 0);
         lv_obj_set_style_bg_opa(shutter_icon, 255, 0);
         lv_obj_set_style_border_width(shutter_icon, 0, 0);
@@ -1228,7 +1339,12 @@ static void mode_btn_event_cb(lv_event_t * e)
     }
 
     if (is_recording && record_callback != NULL) {
-        record_callback(false, record_callback_user_data);
+        camera_page_record_settings_t settings = {
+            record_resolution_options[record_resolution_index].width,
+            record_resolution_options[record_resolution_index].height,
+            record_fps_options[record_fps_index],
+        };
+        record_callback(false, &settings, record_callback_user_data);
     }
     is_recording = false;
     rec_seconds = 0;
@@ -1507,8 +1623,13 @@ static void shutter_btn_event_cb(lv_event_t * e)
 
     if (current_mode == MODE_VIDEO) {
         bool next_recording = !is_recording;
+        camera_page_record_settings_t settings = {
+            record_resolution_options[record_resolution_index].width,
+            record_resolution_options[record_resolution_index].height,
+            record_fps_options[record_fps_index],
+        };
         bool ok = record_callback == NULL ||
-                  record_callback(next_recording, record_callback_user_data);
+                  record_callback(next_recording, &settings, record_callback_user_data);
         if (!ok) {
             printf(next_recording ? "Camera recording start failed.\n"
                                   : "Camera recording stop failed.\n");
@@ -1578,6 +1699,54 @@ static void settings_panel_set_open(bool open)
     lv_anim_start(&a);
 }
 
+static void record_settings_panel_set_open(bool open)
+{
+    if (record_settings_panel == NULL) {
+        return;
+    }
+    if (record_settings_panel_open == open && !record_settings_dragging) {
+        return;
+    }
+
+    record_settings_panel_open = open;
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, record_settings_panel);
+    lv_anim_set_exec_cb(&a, record_settings_panel_set_y);
+    lv_anim_set_values(&a,
+                       lv_obj_get_y(record_settings_panel),
+                       open ? UI_HEIGHT - RECORD_SETTINGS_PANEL_H : UI_HEIGHT);
+    lv_anim_set_time(&a, 180);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
+}
+
+static void record_settings_set_drag_y(int32_t y)
+{
+    if (record_settings_panel == NULL) {
+        return;
+    }
+
+    int32_t next_y = record_settings_drag_start_y + y - record_settings_start_y;
+    lv_obj_set_y(record_settings_panel,
+                 clamp_i32(next_y, UI_HEIGHT - RECORD_SETTINGS_PANEL_H, UI_HEIGHT));
+}
+
+static void record_settings_finish(void)
+{
+    bool open = false;
+
+    if (record_settings_panel != NULL) {
+        int32_t current_y = lv_obj_get_y(record_settings_panel);
+        open = current_y <= UI_HEIGHT - RECORD_SETTINGS_PANEL_H / 2;
+    }
+
+    record_settings_dragging = false;
+    global_record_settings_swipe_tracking = false;
+    record_settings_panel_set_open(open);
+}
+
 static void settings_event_cb(lv_event_t * e)
 {
     lv_event_code_t code = lv_event_get_code(e);
@@ -1615,14 +1784,23 @@ void camera_page_pointer_sample(bool pressed, int32_t x, int32_t y)
 
     if (!camera_page_active) {
         global_quick_swipe_tracking = false;
+        global_record_settings_swipe_tracking = false;
         return;
     }
 
-    if (pressed && !global_quick_swipe_tracking) {
+    if (pressed && !global_quick_swipe_tracking && !global_record_settings_swipe_tracking) {
+        bool record_panel_touch =
+            record_settings_panel_open && y >= UI_HEIGHT - RECORD_SETTINGS_PANEL_H;
         global_quick_swipe_start_y = y;
         global_quick_swipe_tracking = y <= QUICK_EDGE_TOUCH_H;
+        global_record_settings_swipe_tracking =
+            record_panel_touch || y >= UI_HEIGHT - RECORD_SETTINGS_EDGE_TOUCH_H;
         quick_curtain_dragging = false;
         quick_curtain_start_y = y;
+        record_settings_dragging = false;
+        record_settings_start_y = y;
+        record_settings_drag_start_y =
+            record_settings_panel != NULL ? lv_obj_get_y(record_settings_panel) : UI_HEIGHT;
         return;
     }
 
@@ -1630,13 +1808,23 @@ void camera_page_pointer_sample(bool pressed, int32_t x, int32_t y)
         if (quick_curtain_dragging) {
             quick_curtain_finish(y - quick_curtain_start_y);
         }
+        if (record_settings_dragging) {
+            record_settings_finish();
+        }
         quick_curtain_dragging = false;
+        record_settings_dragging = false;
         global_quick_swipe_tracking = false;
+        global_record_settings_swipe_tracking = false;
         return;
     }
 
     if (quick_curtain_dragging) {
         quick_curtain_set_delta(y - quick_curtain_start_y);
+        return;
+    }
+
+    if (record_settings_dragging) {
+        record_settings_set_drag_y(y);
         return;
     }
 
@@ -1646,6 +1834,12 @@ void camera_page_pointer_sample(bool pressed, int32_t x, int32_t y)
         quick_curtain_dragging = true;
         is_recording = false;
         quick_curtain_set_delta(y - quick_curtain_start_y);
+    }
+
+    if (global_record_settings_swipe_tracking &&
+        abs(y - record_settings_start_y) >= QUICK_DRAG_START_DIST) {
+        record_settings_dragging = true;
+        record_settings_set_drag_y(y);
     }
 }
 
@@ -1664,6 +1858,27 @@ static void quick_settings_edge_cb(lv_event_t * e)
         camera_page_active = false;
         clear_camera_page_refs();
         quick_curtain_anim_to(0, quick_curtain_open_ready_cb);
+    }
+}
+
+static void record_settings_edge_cb(lv_event_t * e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    lv_indev_t * indev = lv_indev_get_act();
+
+    lv_event_stop_bubbling(e);
+
+    if (indev == NULL) {
+        return;
+    }
+
+    if (code == LV_EVENT_GESTURE) {
+        lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+        if (dir == LV_DIR_TOP) {
+            record_settings_panel_set_open(true);
+        } else if (dir == LV_DIR_BOTTOM) {
+            record_settings_panel_set_open(false);
+        }
     }
 }
 
@@ -1753,6 +1968,84 @@ static void add_settings_tile(lv_obj_t * parent,
     }
 }
 
+static lv_obj_t *record_option_button_create(lv_obj_t * parent,
+                                             const char * text,
+                                             lv_event_cb_t event_cb,
+                                             uintptr_t index)
+{
+    lv_obj_t * btn = lv_btn_create(parent);
+    lv_obj_set_size(btn, 132, 50);
+    lv_obj_set_style_bg_color(btn, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(btn, 132, 0);
+    lv_obj_set_style_border_color(btn, lv_color_white(), 0);
+    lv_obj_set_style_border_opa(btn, 112, 0);
+    lv_obj_set_style_border_width(btn, 1, 0);
+    lv_obj_set_style_radius(btn, 8, 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_set_style_pad_all(btn, 0, 0);
+    lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_CHAIN);
+    lv_obj_add_event_cb(btn, event_cb, LV_EVENT_CLICKED, (void *)index);
+
+    lv_obj_t * label = label_create(btn, text, lv_color_white(), UI_CJK_FONT);
+    lv_obj_center(label);
+    return btn;
+}
+
+static void create_record_settings_panel(lv_obj_t * parent)
+{
+    record_settings_panel = lv_obj_create(parent);
+    lv_obj_set_size(record_settings_panel, UI_WIDTH, RECORD_SETTINGS_PANEL_H);
+    lv_obj_set_pos(record_settings_panel, 0, UI_HEIGHT);
+    lv_obj_set_style_bg_color(record_settings_panel, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(record_settings_panel, 196, 0);
+    lv_obj_set_style_border_width(record_settings_panel, 0, 0);
+    lv_obj_set_style_radius(record_settings_panel, 0, 0);
+    lv_obj_set_style_pad_all(record_settings_panel, 0, 0);
+    lv_obj_add_flag(record_settings_panel, LV_OBJ_FLAG_FLOATING);
+    lv_obj_clear_flag(record_settings_panel, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_CHAIN);
+    lv_obj_add_flag(record_settings_panel, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(record_settings_panel, record_settings_edge_cb, LV_EVENT_GESTURE, NULL);
+
+    lv_obj_t * grab = lv_obj_create(record_settings_panel);
+    lv_obj_set_size(grab, 86, 5);
+    lv_obj_align(grab, LV_ALIGN_TOP_MID, 0, 12);
+    lv_obj_set_style_bg_color(grab, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(grab, 160, 0);
+    lv_obj_set_style_border_width(grab, 0, 0);
+    lv_obj_set_style_radius(grab, 3, 0);
+    lv_obj_clear_flag(grab, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_CHAIN);
+
+    lv_obj_t * resolution_title =
+        label_create(record_settings_panel, "像素规格", lv_color_white(), UI_CJK_FONT);
+    lv_obj_align(resolution_title, LV_ALIGN_TOP_LEFT, 48, 36);
+
+    lv_obj_t * fps_title =
+        label_create(record_settings_panel, "帧率", lv_color_white(), UI_CJK_FONT);
+    lv_obj_align(fps_title, LV_ALIGN_TOP_LEFT, 48, 116);
+
+    for (size_t i = 0; i < sizeof(record_resolution_options) / sizeof(record_resolution_options[0]); i++) {
+        record_resolution_btns[i] =
+            record_option_button_create(record_settings_panel,
+                                        record_resolution_options[i].label,
+                                        record_resolution_event_cb,
+                                        (uintptr_t)i);
+        lv_obj_set_pos(record_resolution_btns[i], 174 + (int32_t)i * 150, 30);
+    }
+
+    for (size_t i = 0; i < sizeof(record_fps_options) / sizeof(record_fps_options[0]); i++) {
+        char text[12];
+        snprintf(text, sizeof(text), "%u帧", record_fps_options[i]);
+        record_fps_btns[i] =
+            record_option_button_create(record_settings_panel,
+                                        text,
+                                        record_fps_event_cb,
+                                        (uintptr_t)i);
+        lv_obj_set_pos(record_fps_btns[i], 174 + (int32_t)i * 150, 110);
+    }
+
+    record_settings_update_ui();
+}
+
 static void create_settings_panel(lv_obj_t * parent)
 {
     settings_panel = lv_obj_create(parent);
@@ -1789,9 +2082,12 @@ void camera_page_create(uint32_t screen_w, uint32_t screen_h)
     clear_camera_page_refs();
     quick_curtain = NULL;
     quick_curtain_dragging = false;
+    record_settings_dragging = false;
     lv_obj_clean(lv_scr_act());
+    lv_obj_clear_flag(lv_scr_act(), LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_CHAIN);
     global_quick_open_pending = false;
     global_quick_swipe_tracking = false;
+    global_record_settings_swipe_tracking = false;
 
     lv_obj_t * main_bg = lv_obj_create(lv_scr_act());
     lv_obj_set_size(main_bg, screen_w, screen_h);
@@ -1801,6 +2097,7 @@ void camera_page_create(uint32_t screen_w, uint32_t screen_h)
     lv_obj_set_style_border_width(main_bg, 0, 0);
     lv_obj_set_style_radius(main_bg, 0, 0);
     lv_obj_set_style_clip_corner(main_bg, true, 0);
+    lv_obj_clear_flag(main_bg, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_CHAIN);
 
     lv_obj_t * preview = lv_obj_create(main_bg);
     lv_obj_set_size(preview, UI_WIDTH, UI_HEIGHT);
@@ -1811,6 +2108,7 @@ void camera_page_create(uint32_t screen_w, uint32_t screen_h)
     lv_obj_set_style_pad_all(preview, 0, 0);
     lv_obj_set_style_border_width(preview, 0, 0);
     lv_obj_set_style_radius(preview, 0, 0);
+    lv_obj_clear_flag(preview, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_CHAIN);
     lv_obj_add_flag(preview, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(preview, quick_settings_edge_cb, LV_EVENT_ALL, NULL);
     preview_container = preview;
@@ -1865,6 +2163,7 @@ void camera_page_create(uint32_t screen_w, uint32_t screen_h)
     lv_obj_set_style_bg_opa(edge_handle, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(edge_handle, 0, 0);
     lv_obj_set_style_radius(edge_handle, 0, 0);
+    lv_obj_clear_flag(edge_handle, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_CHAIN);
     lv_obj_add_flag(edge_handle, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(edge_handle, settings_event_cb, LV_EVENT_GESTURE, NULL);
 
@@ -1918,6 +2217,7 @@ void camera_page_create(uint32_t screen_w, uint32_t screen_h)
     lv_obj_clear_flag(shutter_icon, LV_OBJ_FLAG_CLICKABLE);
 
     create_settings_panel(preview);
+    create_record_settings_panel(preview);
 
     lv_obj_t * top_edge_handle = lv_obj_create(preview);
     lv_obj_set_size(top_edge_handle, UI_WIDTH, QUICK_EDGE_TOUCH_H);
@@ -1925,9 +2225,21 @@ void camera_page_create(uint32_t screen_w, uint32_t screen_h)
     lv_obj_set_style_bg_opa(top_edge_handle, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(top_edge_handle, 0, 0);
     lv_obj_set_style_radius(top_edge_handle, 0, 0);
+    lv_obj_clear_flag(top_edge_handle, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_CHAIN);
     lv_obj_add_flag(top_edge_handle, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(top_edge_handle, quick_settings_edge_cb, LV_EVENT_ALL, NULL);
     lv_obj_move_foreground(top_edge_handle);
+
+    lv_obj_t * bottom_edge_handle = lv_obj_create(preview);
+    lv_obj_set_size(bottom_edge_handle, UI_WIDTH, RECORD_SETTINGS_EDGE_TOUCH_H);
+    lv_obj_align(bottom_edge_handle, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_opa(bottom_edge_handle, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(bottom_edge_handle, 0, 0);
+    lv_obj_set_style_radius(bottom_edge_handle, 0, 0);
+    lv_obj_clear_flag(bottom_edge_handle, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_CHAIN);
+    lv_obj_add_flag(bottom_edge_handle, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(bottom_edge_handle, record_settings_edge_cb, LV_EVENT_ALL, NULL);
+    lv_obj_move_foreground(bottom_edge_handle);
 
     if (rec_timer == NULL) {
         quick_settings_swipe_self_test();
